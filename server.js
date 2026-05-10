@@ -35,6 +35,7 @@ let users = [
 ];
 
 let knowledgeBase = [];
+let questionsLog = [];
 const upload = multer({ dest: "uploads/" });
 
 function verifyToken(req, res, next) {
@@ -154,10 +155,50 @@ app.get("/knowledge", verifyToken, (req, res) => {
   });
 });
 
+app.get("/analytics", verifyToken, requireRole("admin", "faculty"), (req, res) => {
+  const greetings = ["hi", "hey", "hello", "what's up", "whats up", "hii", "helo", "sup", "yo", "namaste", "ok", "okay", "thanks", "thank you", "bye", "test"];
+
+  const frequency = {};
+  questionsLog.forEach(q => {
+    const key = q.question.toLowerCase().trim();
+
+    if (greetings.includes(key)) return;
+    if (key.length < 10) return;
+
+    if (!frequency[key]) {
+      frequency[key] = {
+        question: q.question,
+        count: 0,
+        lastAsked: q.timestamp,
+        answered: q.answered
+      };
+    }
+    frequency[key].count++;
+    frequency[key].lastAsked = q.timestamp;
+  });
+
+  const sorted = Object.values(frequency)
+    .filter(q => q.count >= 2)
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 20);
+
+  res.json({
+    totalQuestions: questionsLog.length,
+    uniqueQuestions: sorted.length,
+    topQuestions: sorted
+  });
+});
+
 app.post("/chat", async (req, res) => {
   try {
     const { message } = req.body;
     console.log("Message:", message);
+
+    questionsLog.push({
+      question: message,
+      timestamp: new Date().toISOString(),
+      answered: knowledgeBase.length > 0
+    });
 
     let context = "";
     if (knowledgeBase.length > 0) {
@@ -185,7 +226,7 @@ INSTRUCTIONS:
 ${languageInstruction}`
       : `You are a helpful college assistant for students.
 For every message, reply with exactly this and nothing else:
-"I don't have information about that.\n Please contact the "Student Section" for assistance."
+"I don't have information about that.\nPlease contact the Student Section for assistance."
 ${languageInstruction}`;
 
     const response = await groq.chat.completions.create({
