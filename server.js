@@ -36,7 +36,15 @@ let users = [
 
 let knowledgeBase = [];
 let questionsLog = [];
-const upload = multer({ dest: "uploads/" });
+
+const storage = multer.diskStorage({
+  destination: "uploads/",
+  filename: (req, file, cb) => {
+    const unique = Date.now() + "-" + file.originalname;
+    cb(null, unique);
+  }
+});
+const upload = multer({ storage });
 
 function verifyToken(req, res, next) {
   const token = req.headers["authorization"];
@@ -82,6 +90,7 @@ app.post("/upload", verifyToken, requireRole("admin", "faculty"), upload.single(
   try {
     const file = req.file;
     const ext = path.extname(file.originalname).toLowerCase();
+    const downloadable = req.body.downloadable === "true";
     let text = "";
 
     if (ext === ".pdf") {
@@ -111,11 +120,17 @@ app.post("/upload", verifyToken, requireRole("admin", "faculty"), upload.single(
       name: file.originalname,
       content: text,
       uploadedBy: req.user.name,
-      uploadedAt: new Date().toISOString()
+      uploadedAt: new Date().toISOString(),
+      downloadable,
+      filePath: file.path
     });
 
-    fs.unlinkSync(file.path);
-    console.log(`Document uploaded: ${file.originalname} by ${req.user.name}`);
+    if (!downloadable) {
+      fs.unlinkSync(file.path);
+      knowledgeBase[knowledgeBase.length - 1].filePath = null;
+    }
+
+    console.log(`Document uploaded: ${file.originalname} by ${req.user.name} (downloadable: ${downloadable})`);
     res.json({ message: `${file.originalname} uploaded successfully!`, totalDocs: knowledgeBase.length });
   } catch (error) {
     console.error("Upload error:", error.message);
@@ -134,7 +149,9 @@ app.post("/faq", verifyToken, requireRole("admin", "faculty"), async (req, res) 
       name: "FAQ",
       content: `Question: ${question}\nAnswer: ${answer}`,
       uploadedBy: req.user.name,
-      uploadedAt: new Date().toISOString()
+      uploadedAt: new Date().toISOString(),
+      downloadable: false,
+      filePath: null
     });
     console.log(`FAQ added by ${req.user.name}: ${question}`);
     res.json({ message: "FAQ added successfully!", totalDocs: knowledgeBase.length });
@@ -146,13 +163,26 @@ app.post("/faq", verifyToken, requireRole("admin", "faculty"), async (req, res) 
 app.get("/knowledge", verifyToken, (req, res) => {
   res.json({
     total: knowledgeBase.length,
-    items: knowledgeBase.map(item => ({
+    items: knowledgeBase.map((item, index) => ({
+      index,
       type: item.type,
       name: item.name,
       uploadedBy: item.uploadedBy,
-      uploadedAt: item.uploadedAt
+      uploadedAt: item.uploadedAt,
+      downloadable: item.downloadable
     }))
   });
+});
+
+app.get("/download/:index", (req, res) => {
+  const index = parseInt(req.params.index);
+  const item = knowledgeBase[index];
+
+  if (!item) return res.status(404).json({ error: "File not found" });
+  if (!item.downloadable) return res.status(403).json({ error: "This file is not available for download" });
+  if (!item.filePath || !fs.existsSync(item.filePath)) return res.status(404).json({ error: "File no longer exists on server" });
+
+  res.download(item.filePath, item.name);
 });
 
 app.get("/analytics", verifyToken, requireRole("admin", "faculty"), (req, res) => {
@@ -161,10 +191,8 @@ app.get("/analytics", verifyToken, requireRole("admin", "faculty"), (req, res) =
   const frequency = {};
   questionsLog.forEach(q => {
     const key = q.question.toLowerCase().trim();
-
     if (greetings.includes(key)) return;
     if (key.length < 10) return;
-
     if (!frequency[key]) {
       frequency[key] = {
         question: q.question,
@@ -223,6 +251,7 @@ INSTRUCTIONS:
 - If the answer is not in the documents, reply with exactly these two lines:
   "I don't have information about that.\nPlease contact the Student Section for assistance."
 - Be concise — answer in 1-2 sentences maximum unless the question requires more detail
+- Do NOT mention document names or suggest downloading in your reply — the system handles that separately
 ${languageInstruction}`
       : `You are a helpful college assistant for students.
 For every message, reply with exactly this and nothing else:
@@ -237,7 +266,25 @@ ${languageInstruction}`;
       ],
     });
 
-    res.json({ reply: response.choices[0].message.content });
+    const reply = response.choices[0].message.content;
+
+    // Find relevant downloadable documents
+    const words = message.toLowerCase().split(" ").filter(w => w.length > 4);
+    const relevantDocs = knowledgeBase
+      .map((item, index) => ({ ...item, index }))
+      .filter(item => {
+        if (!item.downloadable || item.type !== "document") return false;
+        return words.some(word => item.content.toLowerCase().includes(word) || item.name.toLowerCase().includes(word));
+      });
+
+    res.json({
+      reply,
+      suggestedDocs: relevantDocs.map(doc => ({
+        index: doc.index,
+        name: doc.name
+      }))
+    });
+
   } catch (error) {
     console.error("ERROR:", error.message);
     res.status(500).json({ reply: "Error: " + error.message });
