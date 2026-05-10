@@ -6,6 +6,8 @@ const mammoth = require("mammoth");
 const PDFParser = require("pdf2json");
 const fs = require("fs");
 const path = require("path");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
 require("dotenv").config();
 
 const app = express();
@@ -13,12 +15,69 @@ app.use(cors());
 app.use(express.json());
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+const JWT_SECRET = "college-chatbot-secret-key";
+
+let users = [
+  {
+    id: 1,
+    name: "Admin",
+    email: "admin@college.com",
+    password: bcrypt.hashSync("admin123", 10),
+    role: "admin"
+  },
+  {
+    id: 2,
+    name: "Faculty",
+    email: "faculty@college.com",
+    password: bcrypt.hashSync("faculty123", 10),
+    role: "faculty"
+  }
+];
 
 let knowledgeBase = [];
-
 const upload = multer({ dest: "uploads/" });
 
-app.post("/upload", upload.single("file"), async (req, res) => {
+function verifyToken(req, res, next) {
+  const token = req.headers["authorization"];
+  if (!token) return res.status(401).json({ error: "No token provided" });
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    res.status(401).json({ error: "Invalid token" });
+  }
+}
+
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (!roles.includes(req.user.role)) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+    next();
+  };
+}
+
+app.post("/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const user = users.find(u => u.email === email);
+    if (!user) return res.status(401).json({ error: "Invalid email or password" });
+    const validPassword = await bcrypt.compare(password, user.password);
+    if (!validPassword) return res.status(401).json({ error: "Invalid email or password" });
+    const token = jwt.sign(
+      { id: user.id, name: user.name, email: user.email, role: user.role },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+    console.log(`Login: ${user.email} (${user.role})`);
+    res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role } });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/upload", verifyToken, requireRole("admin", "faculty"), upload.single("file"), async (req, res) => {
   try {
     const file = req.file;
     const ext = path.extname(file.originalname).toLowerCase();
@@ -50,20 +109,20 @@ app.post("/upload", upload.single("file"), async (req, res) => {
       type: "document",
       name: file.originalname,
       content: text,
+      uploadedBy: req.user.name,
       uploadedAt: new Date().toISOString()
     });
 
     fs.unlinkSync(file.path);
-    console.log(`Document uploaded: ${file.originalname}`);
+    console.log(`Document uploaded: ${file.originalname} by ${req.user.name}`);
     res.json({ message: `${file.originalname} uploaded successfully!`, totalDocs: knowledgeBase.length });
-
   } catch (error) {
     console.error("Upload error:", error.message);
     res.status(500).json({ error: error.message });
   }
 });
 
-app.post("/faq", async (req, res) => {
+app.post("/faq", verifyToken, requireRole("admin", "faculty"), async (req, res) => {
   try {
     const { question, answer } = req.body;
     if (!question || !answer) {
@@ -73,21 +132,23 @@ app.post("/faq", async (req, res) => {
       type: "faq",
       name: "FAQ",
       content: `Question: ${question}\nAnswer: ${answer}`,
+      uploadedBy: req.user.name,
       uploadedAt: new Date().toISOString()
     });
-    console.log(`FAQ added: ${question}`);
+    console.log(`FAQ added by ${req.user.name}: ${question}`);
     res.json({ message: "FAQ added successfully!", totalDocs: knowledgeBase.length });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-app.get("/knowledge", (req, res) => {
+app.get("/knowledge", verifyToken, (req, res) => {
   res.json({
     total: knowledgeBase.length,
     items: knowledgeBase.map(item => ({
       type: item.type,
       name: item.name,
+      uploadedBy: item.uploadedBy,
       uploadedAt: item.uploadedAt
     }))
   });
@@ -96,29 +157,36 @@ app.get("/knowledge", (req, res) => {
 app.post("/chat", async (req, res) => {
   try {
     const { message } = req.body;
-    console.log("Received:", message);
+    console.log("Message:", message);
 
     let context = "";
     if (knowledgeBase.length > 0) {
       context = knowledgeBase.map(item => `[${item.name}]:\n${item.content}`).join("\n\n---\n\n");
     }
 
+    const languageInstruction = `CRITICAL LANGUAGE RULE: You MUST detect the exact language the user wrote in and reply in THAT EXACT language only.
+- User wrote in English → reply in English only, zero Hindi words
+- User wrote in Hindi → reply in Hindi only
+- User wrote in Hinglish → reply in Hinglish
+- Never assume language from location, only from what the user actually typed`;
+
     const systemPrompt = knowledgeBase.length > 0
       ? `You are a helpful college assistant for students.
-         You have access to the following college documents and FAQs:
-         
-         ${context}
-         
-         INSTRUCTIONS:
-         - Answer questions ONLY based on the documents and FAQs above
-         - Give ONLY the specific information asked — do not add extra details the user did not ask for
-         - If user asks for date of birth, give ONLY the date of birth, nothing else
-         - If the answer is not in the documents, say "I don't have information about that. Please contact the Student Section for assistance."
-         - Always respond in the same language the user writes in — Hindi, English, or Hinglish
-         - Be concise — answer in 1-2 sentences maximum unless the question requires more detail`
+You have access to the following college documents and FAQs:
+
+${context}
+
+INSTRUCTIONS:
+- Answer questions ONLY based on the documents and FAQs above
+- Give ONLY the specific information asked — do not add extra details
+- If the answer is not in the documents, reply with exactly these two lines:
+  "I don't have information about that.\nPlease contact the Student Section for assistance."
+- Be concise — answer in 1-2 sentences maximum unless the question requires more detail
+${languageInstruction}`
       : `You are a helpful college assistant for students.
-         No documents have been uploaded yet. Tell the user that the admin needs to upload documents first.
-         Always respond in the same language the user writes in — Hindi, English, or Hinglish.`;
+For every message, reply with exactly this and nothing else:
+"I don't have information about that.\n Please contact the "Student Section" for assistance."
+${languageInstruction}`;
 
     const response = await groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
@@ -129,7 +197,6 @@ app.post("/chat", async (req, res) => {
     });
 
     res.json({ reply: response.choices[0].message.content });
-
   } catch (error) {
     console.error("ERROR:", error.message);
     res.status(500).json({ reply: "Error: " + error.message });
