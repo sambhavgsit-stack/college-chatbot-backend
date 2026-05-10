@@ -8,6 +8,7 @@ const fs = require("fs");
 const path = require("path");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const mongoose = require("mongoose");
 require("dotenv").config();
 
 const app = express();
@@ -17,26 +18,63 @@ app.use(express.json());
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const JWT_SECRET = "college-chatbot-secret-key";
 
-let users = [
-  {
-    id: 1,
-    name: "Admin",
-    email: "admin@college.com",
-    password: bcrypt.hashSync("admin123", 10),
-    role: "admin"
-  },
-  {
-    id: 2,
-    name: "Faculty",
-    email: "faculty@college.com",
-    password: bcrypt.hashSync("faculty123", 10),
-    role: "faculty"
+// ===== CONNECT TO MONGODB =====
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => console.log("Connected to MongoDB!"))
+  .catch(err => console.error("MongoDB connection error:", err));
+
+// ===== SCHEMAS =====
+const userSchema = new mongoose.Schema({
+  name: String,
+  email: { type: String, unique: true },
+  password: String,
+  role: { type: String, enum: ["admin", "faculty"], default: "faculty" },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const knowledgeSchema = new mongoose.Schema({
+  type: { type: String, enum: ["document", "faq"] },
+  name: String,
+  content: String,
+  uploadedBy: String,
+  downloadable: { type: Boolean, default: false },
+  filePath: String,
+  uploadedAt: { type: Date, default: Date.now }
+});
+
+const questionSchema = new mongoose.Schema({
+  question: String,
+  answered: Boolean,
+  askedAt: { type: Date, default: Date.now }
+});
+
+const User = mongoose.model("User", userSchema);
+const Knowledge = mongoose.model("Knowledge", knowledgeSchema);
+const Question = mongoose.model("Question", questionSchema);
+
+// ===== SEED DEFAULT USERS =====
+async function seedUsers() {
+  const count = await User.countDocuments();
+  if (count === 0) {
+    await User.create([
+      {
+        name: "Admin",
+        email: "admin@college.com",
+        password: bcrypt.hashSync("admin123", 10),
+        role: "admin"
+      },
+      {
+        name: "Faculty",
+        email: "faculty@college.com",
+        password: bcrypt.hashSync("faculty123", 10),
+        role: "faculty"
+      }
+    ]);
+    console.log("Default users created!");
   }
-];
+}
 
-let knowledgeBase = [];
-let questionsLog = [];
-
+// ===== MIDDLEWARE =====
 const storage = multer.diskStorage({
   destination: "uploads/",
   filename: (req, file, cb) => {
@@ -67,25 +105,27 @@ function requireRole(...roles) {
   };
 }
 
+// ===== LOGIN =====
 app.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
-    const user = users.find(u => u.email === email);
+    const user = await User.findOne({ email });
     if (!user) return res.status(401).json({ error: "Invalid email or password" });
     const validPassword = await bcrypt.compare(password, user.password);
     if (!validPassword) return res.status(401).json({ error: "Invalid email or password" });
     const token = jwt.sign(
-      { id: user.id, name: user.name, email: user.email, role: user.role },
+      { id: user._id, name: user.name, email: user.email, role: user.role },
       JWT_SECRET,
       { expiresIn: "7d" }
     );
     console.log(`Login: ${user.email} (${user.role})`);
-    res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role } });
+    res.json({ token, user: { id: user._id, name: user.name, email: user.email, role: user.role } });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
+// ===== UPLOAD =====
 app.post("/upload", verifyToken, requireRole("admin", "faculty"), upload.single("file"), async (req, res) => {
   try {
     const file = req.file;
@@ -115,122 +155,134 @@ app.post("/upload", verifyToken, requireRole("admin", "faculty"), upload.single(
       return res.status(400).json({ error: "Unsupported file type. Use PDF, DOCX, or TXT." });
     }
 
-    knowledgeBase.push({
+    const doc = await Knowledge.create({
       type: "document",
       name: file.originalname,
       content: text,
       uploadedBy: req.user.name,
-      uploadedAt: new Date().toISOString(),
       downloadable,
-      filePath: file.path
+      filePath: downloadable ? file.path : null
     });
 
-    if (!downloadable) {
-      fs.unlinkSync(file.path);
-      knowledgeBase[knowledgeBase.length - 1].filePath = null;
-    }
+    if (!downloadable) fs.unlinkSync(file.path);
 
-    console.log(`Document uploaded: ${file.originalname} by ${req.user.name} (downloadable: ${downloadable})`);
-    res.json({ message: `${file.originalname} uploaded successfully!`, totalDocs: knowledgeBase.length });
+    console.log(`Document uploaded: ${file.originalname} by ${req.user.name}`);
+    res.json({ message: `${file.originalname} uploaded successfully!` });
   } catch (error) {
     console.error("Upload error:", error.message);
     res.status(500).json({ error: error.message });
   }
 });
 
+// ===== FAQ =====
 app.post("/faq", verifyToken, requireRole("admin", "faculty"), async (req, res) => {
   try {
     const { question, answer } = req.body;
     if (!question || !answer) {
       return res.status(400).json({ error: "Both question and answer are required." });
     }
-    knowledgeBase.push({
+    await Knowledge.create({
       type: "faq",
       name: "FAQ",
       content: `Question: ${question}\nAnswer: ${answer}`,
       uploadedBy: req.user.name,
-      uploadedAt: new Date().toISOString(),
-      downloadable: false,
-      filePath: null
+      downloadable: false
     });
     console.log(`FAQ added by ${req.user.name}: ${question}`);
-    res.json({ message: "FAQ added successfully!", totalDocs: knowledgeBase.length });
+    res.json({ message: "FAQ added successfully!" });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-app.get("/knowledge", verifyToken, (req, res) => {
-  res.json({
-    total: knowledgeBase.length,
-    items: knowledgeBase.map((item, index) => ({
-      index,
-      type: item.type,
-      name: item.name,
-      uploadedBy: item.uploadedBy,
-      uploadedAt: item.uploadedAt,
-      downloadable: item.downloadable
-    }))
-  });
+// ===== KNOWLEDGE BASE =====
+app.get("/knowledge", verifyToken, async (req, res) => {
+  try {
+    const items = await Knowledge.find().sort({ uploadedAt: -1 });
+    res.json({
+      total: items.length,
+      items: items.map(item => ({
+        id: item._id,
+        type: item.type,
+        name: item.name,
+        uploadedBy: item.uploadedBy,
+        uploadedAt: item.uploadedAt,
+        downloadable: item.downloadable
+      }))
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-app.get("/download/:index", (req, res) => {
-  const index = parseInt(req.params.index);
-  const item = knowledgeBase[index];
-
-  if (!item) return res.status(404).json({ error: "File not found" });
-  if (!item.downloadable) return res.status(403).json({ error: "This file is not available for download" });
-  if (!item.filePath || !fs.existsSync(item.filePath)) return res.status(404).json({ error: "File no longer exists on server" });
-
-  res.download(item.filePath, item.name);
+// ===== DOWNLOAD =====
+app.get("/download/:id", async (req, res) => {
+  try {
+    const item = await Knowledge.findById(req.params.id);
+    if (!item) return res.status(404).json({ error: "File not found" });
+    if (!item.downloadable) return res.status(403).json({ error: "This file is not available for download" });
+    if (!item.filePath || !fs.existsSync(item.filePath)) return res.status(404).json({ error: "File no longer exists on server" });
+    res.download(item.filePath, item.name);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
-app.get("/analytics", verifyToken, requireRole("admin", "faculty"), (req, res) => {
-  const greetings = ["hi", "hey", "hello", "what's up", "whats up", "hii", "helo", "sup", "yo", "namaste", "ok", "okay", "thanks", "thank you", "bye", "test"];
+// ===== ANALYTICS =====
+app.get("/analytics", verifyToken, requireRole("admin", "faculty"), async (req, res) => {
+  try {
+    const greetings = ["hi", "hey", "hello", "what's up", "whats up", "hii", "helo", "sup", "yo", "namaste", "ok", "okay", "thanks", "thank you", "bye", "test"];
+    const allQuestions = await Question.find().sort({ askedAt: -1 });
 
-  const frequency = {};
-  questionsLog.forEach(q => {
-    const key = q.question.toLowerCase().trim();
-    if (greetings.includes(key)) return;
-    if (key.length < 10) return;
-    if (!frequency[key]) {
-      frequency[key] = {
-        question: q.question,
-        count: 0,
-        lastAsked: q.timestamp,
-        answered: q.answered
-      };
-    }
-    frequency[key].count++;
-    frequency[key].lastAsked = q.timestamp;
-  });
+    const frequency = {};
+    allQuestions.forEach(q => {
+      const key = q.question.toLowerCase().trim();
+      if (greetings.includes(key)) return;
+      if (key.length < 10) return;
+      if (!frequency[key]) {
+        frequency[key] = { question: q.question, count: 0, lastAsked: q.askedAt };
+      }
+      frequency[key].count++;
+      frequency[key].lastAsked = q.askedAt;
+    });
 
-  const sorted = Object.values(frequency)
-    .filter(q => q.count >= 2)
-    .sort((a, b) => b.count - a.count)
-    .slice(0, 20);
+    const sorted = Object.values(frequency)
+      .filter(q => q.count >= 2)
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 20);
 
-  res.json({
-    totalQuestions: questionsLog.length,
-    uniqueQuestions: sorted.length,
-    topQuestions: sorted
-  });
+    res.json({
+      totalQuestions: allQuestions.length,
+      uniqueQuestions: sorted.length,
+      topQuestions: sorted
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
+// ===== CHAT =====
 app.post("/chat", async (req, res) => {
   try {
     const { message } = req.body;
     console.log("Message:", message);
 
-    questionsLog.push({
-      question: message,
-      timestamp: new Date().toISOString(),
-      answered: knowledgeBase.length > 0
-    });
+    const allKnowledge = await Knowledge.find();
+
+    const greetings = ["hi", "hey", "hello", "what's up", "whats up", "hii", "helo", "sup", "yo", "namaste", "ok", "okay", "thanks", "thank you", "bye", "test"];
+const cleanMessage = message.toLowerCase().trim();
+const shouldLog = cleanMessage.length >= 10 && !greetings.includes(cleanMessage);
+
+  if (shouldLog) {
+    await Question.create({
+    question: message,
+    answered: allKnowledge.length > 0
+  });
+}
 
     let context = "";
-    if (knowledgeBase.length > 0) {
-      context = knowledgeBase.map(item => `[${item.name}]:\n${item.content}`).join("\n\n---\n\n");
+    if (allKnowledge.length > 0) {
+      context = allKnowledge.map(item => `[${item.name}]:\n${item.content}`).join("\n\n---\n\n");
     }
 
     const languageInstruction = `CRITICAL LANGUAGE RULE: You MUST detect the exact language the user wrote in and reply in THAT EXACT language only.
@@ -239,7 +291,7 @@ app.post("/chat", async (req, res) => {
 - User wrote in Hinglish → reply in Hinglish
 - Never assume language from location, only from what the user actually typed`;
 
-    const systemPrompt = knowledgeBase.length > 0
+    const systemPrompt = allKnowledge.length > 0
       ? `You are a helpful college assistant for students.
 You have access to the following college documents and FAQs:
 
@@ -268,19 +320,19 @@ ${languageInstruction}`;
 
     const reply = response.choices[0].message.content;
 
-    // Find relevant downloadable documents
     const words = message.toLowerCase().split(" ").filter(w => w.length > 4);
-    const relevantDocs = knowledgeBase
-      .map((item, index) => ({ ...item, index }))
-      .filter(item => {
-        if (!item.downloadable || item.type !== "document") return false;
-        return words.some(word => item.content.toLowerCase().includes(word) || item.name.toLowerCase().includes(word));
-      });
+    const relevantDocs = allKnowledge.filter(item => {
+      if (!item.downloadable || item.type !== "document") return false;
+      return words.some(word =>
+        item.content.toLowerCase().includes(word) ||
+        item.name.toLowerCase().includes(word)
+      );
+    });
 
     res.json({
       reply,
       suggestedDocs: relevantDocs.map(doc => ({
-        index: doc.index,
+        id: doc._id,
         name: doc.name
       }))
     });
@@ -291,6 +343,10 @@ ${languageInstruction}`;
   }
 });
 
-app.listen(5001, () => {
-  console.log("Backend running on http://localhost:5001");
+// ===== START SERVER =====
+mongoose.connection.once("open", async () => {
+  await seedUsers();
+  app.listen(5001, () => {
+    console.log("Backend running on http://localhost:5001");
+  });
 });
