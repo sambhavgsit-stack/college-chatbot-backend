@@ -13,12 +13,15 @@ const cloudinary = require("cloudinary").v2;
 require("dotenv").config();
 
 const app = express();
+
 app.use(cors({
-  origin: "*",
+  origin: "https://college-chatbot-tan.vercel.app",
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "authorization"],
+  preflightContinue: false,
+  optionsSuccessStatus: 204
 }));
-app.options("/{*path}", cors());
+
 app.use(express.json());
 
 // ===== CLOUDINARY CONFIG =====
@@ -114,6 +117,11 @@ function requireRole(...roles) {
   };
 }
 
+// ===== PING =====
+app.get("/ping", (req, res) => {
+  res.json({ status: "ok" });
+});
+
 // ===== LOGIN =====
 app.post("/login", async (req, res) => {
   try {
@@ -144,7 +152,6 @@ app.post("/upload", verifyToken, requireRole("admin", "faculty"), upload.single(
     let cloudinaryUrl = null;
     let cloudinaryPublicId = null;
 
-    // Extract text
     if (ext === ".pdf") {
       text = await new Promise((resolve, reject) => {
         const pdfParser = new PDFParser();
@@ -168,7 +175,6 @@ app.post("/upload", verifyToken, requireRole("admin", "faculty"), upload.single(
       return res.status(400).json({ error: "Unsupported file type. Use PDF, DOCX, or TXT." });
     }
 
-    // Upload to Cloudinary if downloadable
     if (downloadable) {
       const result = await cloudinary.uploader.upload(file.path, {
         resource_type: "raw",
@@ -180,7 +186,6 @@ app.post("/upload", verifyToken, requireRole("admin", "faculty"), upload.single(
       cloudinaryPublicId = result.public_id;
     }
 
-    // Delete temp file
     fs.unlinkSync(file.path);
 
     await Knowledge.create({
