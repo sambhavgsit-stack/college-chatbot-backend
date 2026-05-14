@@ -9,21 +9,24 @@ const path = require("path");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
+const cloudinary = require("cloudinary").v2;
 require("dotenv").config();
-
-// Create uploads folder if it doesn't exist
-if (!fs.existsSync("uploads")) {
-  fs.mkdirSync("uploads");
-}
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-const JWT_SECRET = "college-chatbot-secret-key";
+// ===== CLOUDINARY CONFIG =====
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
 
-// ===== CONNECT TO MONGODB =====
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+const JWT_SECRET = process.env.JWT_SECRET || "college-chatbot-secret-key";
+
+// ===== MONGODB =====
 mongoose.connect(process.env.MONGODB_URI)
   .then(() => console.log("Connected to MongoDB!"))
   .catch(err => console.error("MongoDB connection error:", err));
@@ -43,7 +46,8 @@ const knowledgeSchema = new mongoose.Schema({
   content: String,
   uploadedBy: String,
   downloadable: { type: Boolean, default: false },
-  filePath: String,
+  cloudinaryUrl: String,
+  cloudinaryPublicId: String,
   uploadedAt: { type: Date, default: Date.now }
 });
 
@@ -57,7 +61,7 @@ const User = mongoose.model("User", userSchema);
 const Knowledge = mongoose.model("Knowledge", knowledgeSchema);
 const Question = mongoose.model("Question", questionSchema);
 
-// ===== SEED DEFAULT USERS =====
+// ===== SEED USERS =====
 async function seedUsers() {
   const count = await User.countDocuments();
   if (count === 0) {
@@ -79,16 +83,11 @@ async function seedUsers() {
   }
 }
 
-// ===== MIDDLEWARE =====
-const storage = multer.diskStorage({
-  destination: "uploads/",
-  filename: (req, file, cb) => {
-    const unique = Date.now() + "-" + file.originalname;
-    cb(null, unique);
-  }
-});
-const upload = multer({ storage });
+// ===== UPLOADS FOLDER =====
+if (!fs.existsSync("uploads")) fs.mkdirSync("uploads");
+const upload = multer({ dest: "uploads/" });
 
+// ===== MIDDLEWARE =====
 function verifyToken(req, res, next) {
   const token = req.headers["authorization"];
   if (!token) return res.status(401).json({ error: "No token provided" });
@@ -137,7 +136,10 @@ app.post("/upload", verifyToken, requireRole("admin", "faculty"), upload.single(
     const ext = path.extname(file.originalname).toLowerCase();
     const downloadable = req.body.downloadable === "true";
     let text = "";
+    let cloudinaryUrl = null;
+    let cloudinaryPublicId = null;
 
+    // Extract text
     if (ext === ".pdf") {
       text = await new Promise((resolve, reject) => {
         const pdfParser = new PDFParser();
@@ -157,19 +159,34 @@ app.post("/upload", verifyToken, requireRole("admin", "faculty"), upload.single(
     } else if (ext === ".txt") {
       text = fs.readFileSync(file.path, "utf8");
     } else {
+      fs.unlinkSync(file.path);
       return res.status(400).json({ error: "Unsupported file type. Use PDF, DOCX, or TXT." });
     }
 
-    const doc = await Knowledge.create({
+    // Upload to Cloudinary if downloadable
+    if (downloadable) {
+      const result = await cloudinary.uploader.upload(file.path, {
+        resource_type: "raw",
+        folder: "college-chatbot",
+        public_id: Date.now() + "-" + file.originalname,
+        use_filename: true,
+      });
+      cloudinaryUrl = result.secure_url;
+      cloudinaryPublicId = result.public_id;
+    }
+
+    // Delete temp file
+    fs.unlinkSync(file.path);
+
+    await Knowledge.create({
       type: "document",
       name: file.originalname,
       content: text,
       uploadedBy: req.user.name,
       downloadable,
-      filePath: downloadable ? file.path : null
+      cloudinaryUrl,
+      cloudinaryPublicId,
     });
-
-    if (!downloadable) fs.unlinkSync(file.path);
 
     console.log(`Document uploaded: ${file.originalname} by ${req.user.name}`);
     res.json({ message: `${file.originalname} uploaded successfully!` });
@@ -191,7 +208,7 @@ app.post("/faq", verifyToken, requireRole("admin", "faculty"), async (req, res) 
       name: "FAQ",
       content: `Question: ${question}\nAnswer: ${answer}`,
       uploadedBy: req.user.name,
-      downloadable: false
+      downloadable: false,
     });
     console.log(`FAQ added by ${req.user.name}: ${question}`);
     res.json({ message: "FAQ added successfully!" });
@@ -212,7 +229,8 @@ app.get("/knowledge", verifyToken, async (req, res) => {
         name: item.name,
         uploadedBy: item.uploadedBy,
         uploadedAt: item.uploadedAt,
-        downloadable: item.downloadable
+        downloadable: item.downloadable,
+        cloudinaryUrl: item.cloudinaryUrl,
       }))
     });
   } catch (error) {
@@ -226,8 +244,8 @@ app.get("/download/:id", async (req, res) => {
     const item = await Knowledge.findById(req.params.id);
     if (!item) return res.status(404).json({ error: "File not found" });
     if (!item.downloadable) return res.status(403).json({ error: "This file is not available for download" });
-    if (!item.filePath || !fs.existsSync(item.filePath)) return res.status(404).json({ error: "File no longer exists on server" });
-    res.download(item.filePath, item.name);
+    if (!item.cloudinaryUrl) return res.status(404).json({ error: "File not available" });
+    res.redirect(item.cloudinaryUrl);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -275,15 +293,15 @@ app.post("/chat", async (req, res) => {
     const allKnowledge = await Knowledge.find();
 
     const greetings = ["hi", "hey", "hello", "what's up", "whats up", "hii", "helo", "sup", "yo", "namaste", "ok", "okay", "thanks", "thank you", "bye", "test"];
-const cleanMessage = message.toLowerCase().trim();
-const shouldLog = cleanMessage.length >= 10 && !greetings.includes(cleanMessage);
+    const cleanMessage = message.toLowerCase().trim();
+    const shouldLog = cleanMessage.length >= 10 && !greetings.includes(cleanMessage);
 
-  if (shouldLog) {
-    await Question.create({
-    question: message,
-    answered: allKnowledge.length > 0
-  });
-}
+    if (shouldLog) {
+      await Question.create({
+        question: message,
+        answered: allKnowledge.length > 0
+      });
+    }
 
     let context = "";
     if (allKnowledge.length > 0) {
@@ -348,10 +366,10 @@ ${languageInstruction}`;
   }
 });
 
-// ===== START SERVER =====
+// ===== START =====
 mongoose.connection.once("open", async () => {
   await seedUsers();
-  app.listen(5001, () => {
-    console.log("Backend running on http://localhost:5001");
+  app.listen(process.env.PORT || 5001, () => {
+    console.log("Backend running!");
   });
 });
